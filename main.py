@@ -32,16 +32,18 @@ storage_client = storage.Client()  # trên Cloud Run tự dùng SA đã gán
 
 MAX_SIZE = 30 * 1024 * 1024  # ~30MB (Cloud Run giới hạn request ~32MiB)
 
-def build_object_path(proj_id: str) -> str:
+def build_object_path(proj_id: str, filename: str) -> str:
     t = time.gmtime()
     y, m = t.tm_year, f"{t.tm_mon:02d}"
-    doc_id = str(int(time.time() * 1000))
-    return f"pending/{y}/{m}/{proj_id.lower()}/{doc_id}.csv"
+    # Loại bỏ extension cũ và thêm .csv
+    name_without_ext = filename.rsplit('.', 1)[0] if '.' in filename else filename
+    return f"pending/{y}/{m}/{proj_id.lower()}/{name_without_ext}.csv"
 
 @app.post("/upload")
 async def upload_csv(
     file: UploadFile = File(...),
     proj_id: str = Form(...),
+    filename: str = Form(...),  # Thêm parameter để user nhập tên file
     uploader: str = Form(default=""),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
@@ -61,7 +63,7 @@ async def upload_csv(
 
     # 4) Ghi lên GCS
     bucket = storage_client.bucket(BUCKET)
-    object_path = build_object_path(proj_id)
+    object_path = build_object_path(proj_id, filename)  # Truyền filename từ user
     blob = bucket.blob(object_path)
     blob.metadata = {"proj_id": proj_id, "uploader": uploader, "schema_version": "v1"}
     blob.upload_from_string(data, content_type="text/csv")
