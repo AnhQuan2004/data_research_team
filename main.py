@@ -1,9 +1,32 @@
 import os, time
-from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Request
+from fastapi.responses import JSONResponse, Response
+from fastapi.middleware.cors import CORSMiddleware
 from google.cloud import storage
 
 app = FastAPI()
+
+# Custom CORS middleware
+@app.middleware("http")
+async def cors_handler(request: Request, call_next):
+    # CORS preflight
+    if request.method == "OPTIONS":
+        headers = {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Idempotency-Key",
+            "Access-Control-Max-Age": "3600",
+        }
+        return Response(status_code=204, headers=headers)
+
+    # Process the request
+    response = await call_next(request)
+    
+    # CORS headers for all responses
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    
+    return response
+
 BUCKET = "data_research"
 storage_client = storage.Client()  # trên Cloud Run tự dùng SA đã gán
 
