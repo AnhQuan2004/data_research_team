@@ -77,105 +77,93 @@
 #     })
 
 
-
 import os, time
-from datetime import timedelta
 from typing import Optional
+from datetime import timedelta
 
 from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
+from fastapi.middleware.cors import CORSMiddleware
 from google.cloud import storage
 
 app = FastAPI()
 
-# ---- CORS đơn giản ----
+# Custom CORS middleware (unchanged)
 @app.middleware("http")
 async def cors_handler(request: Request, call_next):
+    # CORS preflight
     if request.method == "OPTIONS":
         headers = {
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, POST, OPTIONS, PUT, DELETE",
-            "Access-Control-Allow-Headers": "Content-Type, Authorization, Idempotency-Key",
+            "Access-Control-Allow-Headers": "Content-Type",
             "Access-Control-Max-Age": "3600",
         }
         return Response(status_code=204, headers=headers)
 
+    # Process the request
     response = await call_next(request)
+
+    # CORS headers for all responses
     response.headers["Access-Control-Allow-Origin"] = "*"
+
     return response
 
-BUCKET = os.getenv("BUCKET_PENDING", "data_research")
-MAX_SIZE = 30 * 1024 * 1024  # ~30MB
+BUCKET = "data_research"
+storage_client = storage.Client()  # trên Cloud Run tự dùng SA đã gán
 
-storage_client = storage.Client()
+MAX_SIZE = 30 * 1024 * 1024  # ~30MB (Cloud Run giới hạn request ~32MiB)
 
 def build_object_path(proj_id: str, filename: str) -> str:
     t = time.gmtime()
     y, m = t.tm_year, f"{t.tm_mon:02d}"
-    name_without_ext = filename.rsplit(".", 1)[0] if "." in filename else filename
+    # Loại bỏ extension cũ và thêm .csv
+    name_without_ext = filename.rsplit('.', 1)[0] if '.' in filename else filename
     return f"pending/{y}/{m}/{proj_id.lower()}/{name_without_ext}.csv"
 
-# --- Chuẩn hoá UTF-8 + BOM để Excel hiển thị tiếng Việt đúng (tuỳ chọn) ---
-FORCE_UTF8_BOM = True
-def normalize_csv_bytes(raw: bytes) -> bytes:
-    if not FORCE_UTF8_BOM:
-        return raw
-    try:
-        txt = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        for enc in ("cp1258", "latin-1"):
-            try:
-                txt = raw.decode(enc)
-                break
-            except UnicodeDecodeError:
-                continue
-        else:
-            txt = raw.decode("utf-8", errors="replace")
-    if not txt.startswith("\ufeff"):
-        txt = "\ufeff" + txt
-    return txt.encode("utf-8")
-
-# ---- Health ----
-@app.get("/")
-def health():
-    return {"ok": True, "service": "csv-uploader", "bucket": BUCKET}
-
-# ---- Upload ----
+# =========================
+# Upload (kept exactly the same as you sent)
+# =========================
 @app.post("/upload")
 async def upload_csv(
     file: UploadFile = File(...),
     proj_id: str = Form(...),
-    filename: str = Form(...),
+    filename: str = Form(...),  # Thêm parameter để user nhập tên file
     uploader: str = Form(default=""),
-    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
+    # 1) Kiểm tra loại file
     if file.content_type not in ("text/csv", "application/vnd.ms-excel"):
         raise HTTPException(status_code=415, detail="Unsupported Media Type: expected text/csv")
 
+    # 2) Đọc nội dung (giới hạn kích thước)
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="Empty file")
     if len(data) > MAX_SIZE:
         raise HTTPException(status_code=413, detail="File too large for direct upload; use Signed URL flow")
 
-    data = normalize_csv_bytes(data)
+    # 3) (Tuỳ chọn) Idempotency: kiểm trùng theo header
+    # Bạn có thể lưu idempotency_key vào Redis/DB để tránh ghi trùng khi client retry.
 
+    # 4) Ghi lên GCS
     bucket = storage_client.bucket(BUCKET)
-    object_path = build_object_path(proj_id, filename)
+    object_path = build_object_path(proj_id, filename)  # Truyền filename từ user
     blob = bucket.blob(object_path)
     blob.metadata = {"proj_id": proj_id, "uploader": uploader, "schema_version": "v1"}
-    blob.upload_from_string(data, content_type="text/csv; charset=utf-8")
+    blob.upload_from_string(data, content_type="text/csv")
 
     return JSONResponse({
         "ok": True,
         "gcs_uri": f"gs://{BUCKET}/{object_path}",
         "size": len(data),
         "proj_id": proj_id,
-        "status": "pending",
-        "object_name": object_path,
+        "status": "pending"
     })
 
-# ---- List files ----
+# =========================
+# List files with filters + pagination
+# =========================
 @app.get("/files")
 def list_files(
     proj_id: Optional[str] = None,
@@ -188,16 +176,22 @@ def list_files(
         raise HTTPException(status_code=400, detail="page_size must be 1..1000")
 
     bucket = storage_client.bucket(BUCKET)
+
+    # prefix: pending/<year>/<month>/<proj_id> (có thể thiếu các phần nếu không filter)
     parts = ["pending"]
-    if year:  parts.append(str(year))
-    if month: parts.append(f"{int(month):02d}")
-    if proj_id: parts.append(proj_id.lower())
+    if year:
+        parts.append(str(year))
+    if month:
+        parts.append(f"{int(month):02d}")
+    if proj_id:
+        parts.append(proj_id.lower())
     prefix = "/".join(parts)
 
     it = bucket.list_blobs(prefix=prefix, max_results=page_size, page_token=page_token)
+
     items = []
     for b in it:
-        if b.name.endswith("/"):  # bỏ "thư mục ảo"
+        if b.name.endswith("/"):  # bỏ thư mục ảo
             continue
         items.append({
             "name": b.name,
@@ -208,18 +202,34 @@ def list_files(
         })
 
     next_token = getattr(it, "next_page_token", None)
-    return {"ok": True, "prefix": prefix, "count": len(items), "next_page_token": next_token, "items": items}
 
-# ---- Download (signed URL) ----
+    return {
+        "ok": True,
+        "prefix": prefix,
+        "count": len(items),
+        "next_page_token": next_token,
+        "items": items
+    }
+
+# =========================
+# Download (Signed URL)
+# =========================
 @app.get("/download")
 def get_signed_download_url(
     gcs_uri: Optional[str] = None,
     object_name: Optional[str] = None,
     expires_minutes: int = 15,
 ):
+    """
+    Trả về signed URL để tải file trực tiếp từ GCS.
+    Truyền EITHER:
+      - gcs_uri="gs://data_research/pending/2025/08/solana/xyz.csv"
+      - object_name="pending/2025/08/solana/xyz.csv"
+    """
     if not gcs_uri and not object_name:
         raise HTTPException(status_code=400, detail="Provide gcs_uri or object_name")
 
+    # Parse gs:// nếu cần
     if gcs_uri:
         if not gcs_uri.startswith("gs://"):
             raise HTTPException(status_code=400, detail="gcs_uri must start with gs://")
@@ -228,6 +238,7 @@ def get_signed_download_url(
     else:
         bucket_name, obj = BUCKET, object_name
 
+    # Chỉ cho phép tải từ đúng bucket cấu hình
     if bucket_name != BUCKET:
         raise HTTPException(status_code=403, detail="Access to this bucket is not allowed")
 
