@@ -183,6 +183,8 @@ from datetime import datetime, timedelta
 from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from google.cloud import storage
+from datetime import datetime, timezone
+from google.api_core import exceptions as gexc
 
 app = FastAPI()
 
@@ -340,3 +342,56 @@ def approve_file(
     new_blob.patch()
 
     return {"ok": True, "from": obj, "to": new_path, "status": "approved"}
+
+
+# ===== Reject =====
+@app.post("/reject")
+def reject_object(
+    object_name: str,           # ví dụ: pending/2025/08/solana/xxx.csv
+    rejector: str = "",         # người reject
+    feedback: str = "",         # feedback chi tiết
+):
+    try:
+        if not object_name.startswith("pending/"):
+            raise HTTPException(status_code=400, detail="Only pending/* can be rejected")
+
+        bucket = storage_client.bucket(BUCKET)
+        src = bucket.blob(object_name)
+        if not src.exists():
+            raise HTTPException(status_code=404, detail="Source object not found")
+
+        # pending/YYYY/MM/proj/file.csv -> rejected/YYYY/MM/proj/file.csv
+        parts = object_name.split("/", 4)
+        dst_name = f"rejected/{parts[1]}/{parts[2]}/{parts[3]}/{parts[4]}"
+
+        # copy sang rejected/...
+        bucket.copy_blob(src, bucket, new_name=dst_name)
+
+        # cập nhật metadata ở file đích
+        dst = bucket.blob(dst_name)
+        dst.reload()
+        md = dst.metadata or {}
+        md.update({
+            "status": "rejected",
+            "rejected_by": rejector or "",
+            "rejected_at": datetime.now(timezone.utc).isoformat(),
+            "feedback": feedback or "",            # << lưu feedback
+        })
+        dst.metadata = md
+        dst.patch()
+
+        # xoá nguồn, tránh race condition
+        src.reload()
+        bucket.delete_blob(src.name, if_generation_match=src.generation)
+
+        return {
+            "ok": True,
+            "from": f"gs://{BUCKET}/{object_name}",
+            "to": f"gs://{BUCKET}/{dst_name}",
+            "status": "rejected"
+        }
+
+    except gexc.Forbidden as e:
+        raise HTTPException(status_code=403, detail=f"GCS permission error: {e.message}")
+    except gexc.NotFound as e:
+        raise HTTPException(status_code=404, detail=f"GCS not found: {e.message}")
