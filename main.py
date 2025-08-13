@@ -1,44 +1,43 @@
-import os, time
-from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, Response
-from fastapi.middleware.cors import CORSMiddleware
-from google.cloud import storage
+# import os, time
+# from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Request
+# from fastapi.responses import JSONResponse, Response
+# from fastapi.middleware.cors import CORSMiddleware
+# from google.cloud import storage
 
-app = FastAPI()
+# app = FastAPI()
 
-# Custom CORS middleware
-@app.middleware("http")
-async def cors_handler(request: Request, call_next):
-    # CORS preflight
-    if request.method == "OPTIONS":
-        headers = {
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, OPTIONS, PUT, DELETE",
-            "Access-Control-Allow-Headers": "Content-Type",
-            "Access-Control-Max-Age": "3600",
-        }
-        return Response(status_code=204, headers=headers)
+# # Custom CORS middleware
+# @app.middleware("http")
+# async def cors_handler(request: Request, call_next):
+#     # CORS preflight
+#     if request.method == "OPTIONS":
+#         headers = {
+#             "Access-Control-Allow-Origin": "*",
+#             "Access-Control-Allow-Methods": "GET, POST, OPTIONS, PUT, DELETE",
+#             "Access-Control-Allow-Headers": "Content-Type",
+#             "Access-Control-Max-Age": "3600",
+#         }
+#         return Response(status_code=204, headers=headers)
 
-    # Process the request
-    response = await call_next(request)
+#     # Process the request
+#     response = await call_next(request)
     
-    # CORS headers for all responses
-    response.headers["Access-Control-Allow-Origin"] = "*"
+#     # CORS headers for all responses
+#     response.headers["Access-Control-Allow-Origin"] = "*"
     
-    return response
+#     return response
 
-BUCKET = "data_research"
-storage_client = storage.Client()  # trên Cloud Run tự dùng SA đã gán
+# BUCKET = "data_research"
+# storage_client = storage.Client()  # trên Cloud Run tự dùng SA đã gán
 
-MAX_SIZE = 30 * 1024 * 1024  # ~30MB (Cloud Run giới hạn request ~32MiB)
+# MAX_SIZE = 30 * 1024 * 1024  # ~30MB (Cloud Run giới hạn request ~32MiB)
 
-def build_object_path(proj_id: str, filename: str) -> str:
-    t = time.gmtime()
-    y, m = t.tm_year, f"{t.tm_mon:02d}"
-    # Loại bỏ extension cũ và thêm .csv
-    name_without_ext = filename.rsplit('.', 1)[0] if '.' in filename else filename
-    return f"pending/{y}/{m}/{proj_id.lower()}/{name_without_ext}.csv"
-
+# def build_object_path(proj_id: str, filename: str) -> str:
+#     t = time.gmtime()
+#     y, m = t.tm_year, f"{t.tm_mon:02d}"
+#     # Loại bỏ extension cũ và thêm .csv
+#     name_without_ext = filename.rsplit('.', 1)[0] if '.' in filename else filename
+#     return f"pending/{y}/{m}/{proj_id.lower()}/{name_without_ext}.csv"
 
 # @app.post("/upload")
 # async def upload_csv(
@@ -77,17 +76,71 @@ def build_object_path(proj_id: str, filename: str) -> str:
 #         "status": "pending"
 #     })
 
-# =========================
-# Health
-# =========================
+
+
+import os, time
+from datetime import timedelta
+from typing import Optional
+
+from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Request
+from fastapi.responses import JSONResponse, Response
+from google.cloud import storage
+
+app = FastAPI()
+
+# ---- CORS đơn giản ----
+@app.middleware("http")
+async def cors_handler(request: Request, call_next):
+    if request.method == "OPTIONS":
+        headers = {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS, PUT, DELETE",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization, Idempotency-Key",
+            "Access-Control-Max-Age": "3600",
+        }
+        return Response(status_code=204, headers=headers)
+
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    return response
+
+BUCKET = os.getenv("BUCKET_PENDING", "data_research")
+MAX_SIZE = 30 * 1024 * 1024  # ~30MB
+
+storage_client = storage.Client()
+
+def build_object_path(proj_id: str, filename: str) -> str:
+    t = time.gmtime()
+    y, m = t.tm_year, f"{t.tm_mon:02d}"
+    name_without_ext = filename.rsplit(".", 1)[0] if "." in filename else filename
+    return f"pending/{y}/{m}/{proj_id.lower()}/{name_without_ext}.csv"
+
+# --- Chuẩn hoá UTF-8 + BOM để Excel hiển thị tiếng Việt đúng (tuỳ chọn) ---
+FORCE_UTF8_BOM = True
+def normalize_csv_bytes(raw: bytes) -> bytes:
+    if not FORCE_UTF8_BOM:
+        return raw
+    try:
+        txt = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        for enc in ("cp1258", "latin-1"):
+            try:
+                txt = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            txt = raw.decode("utf-8", errors="replace")
+    if not txt.startswith("\ufeff"):
+        txt = "\ufeff" + txt
+    return txt.encode("utf-8")
+
+# ---- Health ----
 @app.get("/")
 def health():
     return {"ok": True, "service": "csv-uploader", "bucket": BUCKET}
 
-
-# =========================
-# Upload
-# =========================
+# ---- Upload ----
 @app.post("/upload")
 async def upload_csv(
     file: UploadFile = File(...),
@@ -105,33 +158,24 @@ async def upload_csv(
     if len(data) > MAX_SIZE:
         raise HTTPException(status_code=413, detail="File too large for direct upload; use Signed URL flow")
 
-    # Optional idempotency (store key in DB/redis to prevent duplicate writes) — omitted here
-
-    # Normalize encoding for Excel/UTF-8 safety
     data = normalize_csv_bytes(data)
 
     bucket = storage_client.bucket(BUCKET)
     object_path = build_object_path(proj_id, filename)
     blob = bucket.blob(object_path)
-
     blob.metadata = {"proj_id": proj_id, "uploader": uploader, "schema_version": "v1"}
     blob.upload_from_string(data, content_type="text/csv; charset=utf-8")
 
-    return JSONResponse(
-        {
-            "ok": True,
-            "gcs_uri": f"gs://{BUCKET}/{object_path}",
-            "size": len(data),
-            "proj_id": proj_id,
-            "status": "pending",
-            "object_name": object_path,
-        }
-    )
+    return JSONResponse({
+        "ok": True,
+        "gcs_uri": f"gs://{BUCKET}/{object_path}",
+        "size": len(data),
+        "proj_id": proj_id,
+        "status": "pending",
+        "object_name": object_path,
+    })
 
-
-# =========================
-# List files with filters + pagination
-# =========================
+# ---- List files ----
 @app.get("/files")
 def list_files(
     proj_id: Optional[str] = None,
@@ -144,40 +188,29 @@ def list_files(
         raise HTTPException(status_code=400, detail="page_size must be 1..1000")
 
     bucket = storage_client.bucket(BUCKET)
-
     parts = ["pending"]
-    if year:
-        parts.append(str(year))
-    if month:
-        parts.append(f"{int(month):02d}")
-    if proj_id:
-        parts.append(proj_id.lower())
+    if year:  parts.append(str(year))
+    if month: parts.append(f"{int(month):02d}")
+    if proj_id: parts.append(proj_id.lower())
     prefix = "/".join(parts)
 
     it = bucket.list_blobs(prefix=prefix, max_results=page_size, page_token=page_token)
-
     items = []
     for b in it:
-        if b.name.endswith("/"):
+        if b.name.endswith("/"):  # bỏ "thư mục ảo"
             continue
-        items.append(
-            {
-                "name": b.name,
-                "gcs_uri": f"gs://{BUCKET}/{b.name}",
-                "size": b.size,
-                "updated": b.updated.isoformat() if b.updated else None,
-                "metadata": b.metadata or {},
-            }
-        )
+        items.append({
+            "name": b.name,
+            "gcs_uri": f"gs://{BUCKET}/{b.name}",
+            "size": b.size,
+            "updated": b.updated.isoformat() if b.updated else None,
+            "metadata": b.metadata or {},
+        })
 
     next_token = getattr(it, "next_page_token", None)
-
     return {"ok": True, "prefix": prefix, "count": len(items), "next_page_token": next_token, "items": items}
 
-
-# =========================
-# Download (Signed URL)
-# =========================
+# ---- Download (signed URL) ----
 @app.get("/download")
 def get_signed_download_url(
     gcs_uri: Optional[str] = None,
