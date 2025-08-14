@@ -185,8 +185,6 @@ from fastapi.responses import JSONResponse, Response
 from google.cloud import storage
 from datetime import datetime, timezone
 from google.api_core import exceptions as gexc
-from pydantic import BaseModel
-import os
 
 app = FastAPI()
 
