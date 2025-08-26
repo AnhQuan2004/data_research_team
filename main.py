@@ -36,29 +36,22 @@ async def cors_handler(request: Request, call_next):
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return response
+
 # =========================
 # Helpers
 # =========================
-def build_object_path(status_folder: str, proj_id: str, filename: str) -> str:
+def require_bucket() -> storage.Bucket:
+    if not BUCKET:
+        raise HTTPException(status_code=500, detail="BUCKET env is not set")
+    return storage_client.bucket(BUCKET)
+
+
+def build_object_path_csv(status_folder: str, proj_id: str, filename: str) -> str:
     """Always writes .csv"""
     t = time.gmtime()
     y, m = t.tm_year, f"{t.tm_mon:02d}"
     name_without_ext = filename.rsplit(".", 1)[0] if "." in filename else filename
     return f"{status_folder}/{y}/{m}/{proj_id.lower()}/{name_without_ext}.csv"
-
-
-def build_object_path_ext(status_folder: str, proj_id: str, filename: str, ext: str) -> str:
-    """Writes with custom extension (e.g., .json)"""
-    t = time.gmtime()
-    y, m = t.tm_year, f"{t.tm_mon:02d}"
-    name_without_ext = filename.rsplit(".", 1)[0] if "." in filename else filename
-    return f"{status_folder}/{y}/{m}/{proj_id.lower()}/{name_without_ext}.{ext.lstrip('.')}"
-
-
-def require_bucket() -> storage.Bucket:
-    if not BUCKET:
-        raise HTTPException(status_code=500, detail="BUCKET env is not set")
-    return storage_client.bucket(BUCKET)
 
 
 # =========================
@@ -90,7 +83,7 @@ async def upload_csv(
         raise HTTPException(status_code=413, detail=f"File too large (> {MAX_SIZE_MB}MB)")
 
     bucket = require_bucket()
-    object_path = build_object_path("pending", proj_id, filename)
+    object_path = build_object_path_csv("pending", proj_id, filename)
     blob = bucket.blob(object_path)
     blob.metadata = {
         "proj_id": proj_id,
@@ -101,45 +94,107 @@ async def upload_csv(
         "idempotency_key": idempotency_key or "",
     }
 
-    # Create/overwrite (straightforward). If bạn muốn chống ghi đè theo idempotency_key, có thể kiểm tra trước.
     blob.upload_from_string(data, content_type="text/csv")
     return {"ok": True, "gcs_uri": f"gs://{BUCKET}/{object_path}", "status": "pending"}
 
 
 # =========================
-# Submit JSON (NEW)
+# Submit JSON (NO filename; split by project_id)
 # =========================
 @app.post("/submit-json")
-async def submit_json(
+async def submit_json_v3(
     payload: dict = Body(..., media_type="application/json"),
-    proj_id: Optional[str] = Query(default=None),
-    filename: Optional[str] = Query(default=None),
     uploader: Optional[str] = Query(default=""),
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ):
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-
-    proj = (proj_id or payload.get("proj_id") or "default").lower()
-    fname = filename or payload.get("filename") or "submission"
-
-    data_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    if len(data_bytes) > MAX_SIZE:
-        raise HTTPException(status_code=413, detail=f"Payload too large (> {MAX_SIZE_MB}MB)")
-
-    bucket = require_bucket()
-    object_path = build_object_path_ext("pending", proj, fname, "json")
-    blob = bucket.blob(object_path)
-    blob.metadata = {
-        "proj_id": proj,
-        "uploader": uploader or payload.get("uploader", ""),
-        "schema_version": "v1",
-        "status": "pending",
-        "content": "json",
-        "idempotency_key": idempotency_key or "",
+    """
+    Payload:
+    {
+      "questions_main": [
+        { "project_id": "...", "q_id": ..., "question": "...", "result": 0|1, "detail": "...", "source": "..." },
+        ...
+      ]
     }
-    blob.upload_from_string(data_bytes, content_type="application/json")
-    return {"ok": True, "gcs_uri": f"gs://{BUCKET}/{object_path}", "status": "pending"}
+    - Group theo project_id
+    - Tự sinh tên file: pending/YYYY/MM/<project_id>/<YYYYMMDDTHHMMSS>-<uuid6>.json
+    - Mỗi project_id -> 1 file chứa chỉ các item của project đó
+    """
+    # --- Validate tổng thể ---
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Payload must be a JSON object.")
+    if "questions_main" not in payload or not isinstance(payload["questions_main"], list):
+        raise HTTPException(status_code=400, detail="questions_main must be a list.")
+    if not payload["questions_main"]:
+        raise HTTPException(status_code=400, detail="questions_main cannot be empty.")
+
+    # --- Validate từng item & group theo project_id ---
+    groups = {}
+    for idx, item in enumerate(payload["questions_main"], start=1):
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=400, detail=f"Item #{idx} must be an object.")
+        required = ["project_id", "q_id", "question", "result", "detail", "source"]
+        miss = [k for k in required if k not in item]
+        if miss:
+            raise HTTPException(status_code=400, detail=f"Item #{idx} missing fields: {', '.join(miss)}")
+
+        project_id = item["project_id"]
+        if not isinstance(project_id, str) or not project_id.strip():
+            raise HTTPException(status_code=400, detail=f"Item #{idx}: project_id must be string.")
+        project_id = project_id.lower().strip()
+
+        # normalize result -> int in {0,1}
+        if item["result"] not in (0, 1, "0", "1"):
+            raise HTTPException(status_code=400, detail=f"Item #{idx}: result must be 0 or 1.")
+        item["result"] = int(item["result"])
+
+        # basic checks for strings
+        for k in ["question", "detail", "source"]:
+            if not isinstance(item[k], str) or not item[k].strip():
+                raise HTTPException(status_code=400, detail=f"Item #{idx}: {k} must be a non-empty string.")
+            item[k] = item[k].strip()
+
+        groups.setdefault(project_id, []).append(item)
+
+    # --- Chuẩn bị & ghi GCS ---
+    bucket = require_bucket()
+    results = []
+    now = datetime.utcnow()
+    ts = now.strftime("%Y%m%dT%H%M%S")
+    year = now.year
+    month = f"{now.month:02d}"
+
+    for proj, items in groups.items():
+        file_payload = {"questions_main": items}
+        data_bytes = json.dumps(file_payload, ensure_ascii=False).encode("utf-8")
+        if len(data_bytes) > MAX_SIZE:
+            raise HTTPException(status_code=413, detail=f"Payload for {proj} too large (> {MAX_SIZE_MB}MB)")
+
+        suffix = uuid.uuid4().hex[:6]
+        object_path = f"pending/{year}/{month}/{proj}/{ts}-{suffix}.json"
+
+        blob = bucket.blob(object_path)
+        md = {
+            "proj_id": proj,
+            "uploader": uploader or "",
+            "schema_version": "v3",
+            "status": "pending",
+            "content": "json",
+            "idempotency_key": idempotency_key or "",
+            "items_count": str(len(items)),
+        }
+        blob.metadata = md
+        blob.upload_from_string(data_bytes, content_type="application/json")
+
+        results.append(
+            {
+                "project_id": proj,
+                "gcs_uri": f"gs://{BUCKET}/{object_path}",
+                "count": len(items),
+                "status": "pending",
+            }
+        )
+
+    return {"ok": True, "written": results}
 
 
 # =========================
@@ -182,9 +237,7 @@ def list_files(
             }
         )
 
-    # Try read iterator next_page_token (google-cloud-storage provides it on the iterator)
     next_token = getattr(it, "next_page_token", None)
-
     return {"ok": True, "prefix": prefix, "count": len(items), "items": items, "next_page_token": next_token}
 
 
@@ -248,6 +301,8 @@ def approve_file(
     parts = obj.split("/")
     if parts[0] != "pending":
         raise HTTPException(status_code=400, detail="Only pending files can be approved")
+    if len(parts) < 5:
+        raise HTTPException(status_code=400, detail="Invalid object path format")
     _, year, month, proj_id, filename = parts
     new_path = f"approved/{year}/{month}/{proj_id}/{filename}"
 
@@ -276,7 +331,7 @@ def approve_file(
 # =========================
 @app.post("/reject")
 def reject_object(
-    object_name: str = Query(..., description="e.g. pending/2025/08/solana/xxx.csv"),
+    object_name: str = Query(..., description="e.g. pending/2025/08/solana/xxx.json"),
     rejector: str = Query(default=""),
     feedback: str = Query(default=""),
 ):
