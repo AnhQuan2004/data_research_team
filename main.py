@@ -1,14 +1,25 @@
-
-import os, time
+import os
+import time
+import json
 from typing import Optional
-from datetime import datetime, timedelta
-from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Request
+from datetime import datetime, timedelta, timezone
+
+from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Request, Body, Query
 from fastapi.responses import JSONResponse, Response
 from google.cloud import storage
-from datetime import datetime, timezone
 from google.api_core import exceptions as gexc
 
+# =========================
+# Config
+# =========================
 app = FastAPI()
+
+BUCKET = os.getenv("BUCKET", "data_research")
+MAX_SIZE_MB = int(os.getenv("MAX_SIZE_MB", "30"))
+MAX_SIZE = MAX_SIZE_MB * 1024 * 1024  # default 30MB
+
+storage_client = storage.Client()
+
 
 # ===== CORS middleware =====
 @app.middleware("http")
@@ -25,18 +36,42 @@ async def cors_handler(request: Request, call_next):
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return response
-
-BUCKET = "data_research"
-storage_client = storage.Client()
-MAX_SIZE = 30 * 1024 * 1024  # 30MB
-
+# =========================
+# Helpers
+# =========================
 def build_object_path(status_folder: str, proj_id: str, filename: str) -> str:
+    """Always writes .csv"""
     t = time.gmtime()
     y, m = t.tm_year, f"{t.tm_mon:02d}"
-    name_without_ext = filename.rsplit('.', 1)[0] if '.' in filename else filename
+    name_without_ext = filename.rsplit(".", 1)[0] if "." in filename else filename
     return f"{status_folder}/{y}/{m}/{proj_id.lower()}/{name_without_ext}.csv"
 
-# ===== Upload =====
+
+def build_object_path_ext(status_folder: str, proj_id: str, filename: str, ext: str) -> str:
+    """Writes with custom extension (e.g., .json)"""
+    t = time.gmtime()
+    y, m = t.tm_year, f"{t.tm_mon:02d}"
+    name_without_ext = filename.rsplit(".", 1)[0] if "." in filename else filename
+    return f"{status_folder}/{y}/{m}/{proj_id.lower()}/{name_without_ext}.{ext.lstrip('.')}"
+
+
+def require_bucket() -> storage.Bucket:
+    if not BUCKET:
+        raise HTTPException(status_code=500, detail="BUCKET env is not set")
+    return storage_client.bucket(BUCKET)
+
+
+# =========================
+# Health
+# =========================
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "bucket": BUCKET, "max_size_mb": MAX_SIZE_MB}
+
+
+# =========================
+# Upload CSV
+# =========================
 @app.post("/upload")
 async def upload_csv(
     file: UploadFile = File(...),
@@ -45,15 +80,16 @@ async def upload_csv(
     uploader: str = Form(default=""),
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ):
-    if file.content_type not in ("text/csv", "application/vnd.ms-excel"):
+    if file.content_type not in ("text/csv", "application/vnd.ms-excel", "application/csv"):
         raise HTTPException(status_code=415, detail="Unsupported Media Type: expected text/csv")
+
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="Empty file")
     if len(data) > MAX_SIZE:
-        raise HTTPException(status_code=413, detail="File too large")
+        raise HTTPException(status_code=413, detail=f"File too large (> {MAX_SIZE_MB}MB)")
 
-    bucket = storage_client.bucket(BUCKET)
+    bucket = require_bucket()
     object_path = build_object_path("pending", proj_id, filename)
     blob = bucket.blob(object_path)
     blob.metadata = {
@@ -61,21 +97,64 @@ async def upload_csv(
         "uploader": uploader,
         "schema_version": "v1",
         "status": "pending",
+        "content": "csv",
+        "idempotency_key": idempotency_key or "",
     }
+
+    # Create/overwrite (straightforward). If bạn muốn chống ghi đè theo idempotency_key, có thể kiểm tra trước.
     blob.upload_from_string(data, content_type="text/csv")
     return {"ok": True, "gcs_uri": f"gs://{BUCKET}/{object_path}", "status": "pending"}
 
-# ===== List =====
+
+# =========================
+# Submit JSON (NEW)
+# =========================
+@app.post("/submit-json")
+async def submit_json(
+    payload: dict = Body(..., media_type="application/json"),
+    proj_id: Optional[str] = Query(default=None),
+    filename: Optional[str] = Query(default=None),
+    uploader: Optional[str] = Query(default=""),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+):
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    proj = (proj_id or payload.get("proj_id") or "default").lower()
+    fname = filename or payload.get("filename") or "submission"
+
+    data_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    if len(data_bytes) > MAX_SIZE:
+        raise HTTPException(status_code=413, detail=f"Payload too large (> {MAX_SIZE_MB}MB)")
+
+    bucket = require_bucket()
+    object_path = build_object_path_ext("pending", proj, fname, "json")
+    blob = bucket.blob(object_path)
+    blob.metadata = {
+        "proj_id": proj,
+        "uploader": uploader or payload.get("uploader", ""),
+        "schema_version": "v1",
+        "status": "pending",
+        "content": "json",
+        "idempotency_key": idempotency_key or "",
+    }
+    blob.upload_from_string(data_bytes, content_type="application/json")
+    return {"ok": True, "gcs_uri": f"gs://{BUCKET}/{object_path}", "status": "pending"}
+
+
+# =========================
+# List files
+# =========================
 @app.get("/files")
 def list_files(
-    status_folder: str = "pending",
-    proj_id: Optional[str] = None,
-    year: Optional[int] = None,
-    month: Optional[int] = None,
-    page_size: int = 50,
-    page_token: Optional[str] = None,
+    status_folder: str = Query(default="pending"),
+    proj_id: Optional[str] = Query(default=None),
+    year: Optional[int] = Query(default=None),
+    month: Optional[int] = Query(default=None),
+    page_size: int = Query(default=50, ge=1, le=1000),
+    page_token: Optional[str] = Query(default=None),
 ):
-    bucket = storage_client.bucket(BUCKET)
+    bucket = require_bucket()
     parts = [status_folder]
     if year:
         parts.append(str(year))
@@ -84,30 +163,43 @@ def list_files(
     if proj_id:
         parts.append(proj_id.lower())
     prefix = "/".join(parts)
+
     it = bucket.list_blobs(prefix=prefix, max_results=page_size, page_token=page_token)
     items = []
     for b in it:
+        # Skip "directory" placeholders
         if b.name.endswith("/"):
             continue
-        items.append({
-            "name": b.name,
-            "gcs_uri": f"gs://{BUCKET}/{b.name}",
-            "size": b.size,
-            "updated": b.updated.isoformat() if b.updated else None,
-            "metadata": b.metadata or {},
-            "feedback": b.metadata.get("feedback", "") if status_folder == "rejected" else None
-        })
-    return {"ok": True, "prefix": prefix, "count": len(items), "items": items}
+        md = b.metadata or {}
+        items.append(
+            {
+                "name": b.name,
+                "gcs_uri": f"gs://{BUCKET}/{b.name}",
+                "size": b.size,
+                "updated": b.updated.isoformat() if b.updated else None,
+                "metadata": md,
+                "feedback": md.get("feedback", "") if status_folder == "rejected" else None,
+            }
+        )
 
-# ===== Download (Signed URL) =====
+    # Try read iterator next_page_token (google-cloud-storage provides it on the iterator)
+    next_token = getattr(it, "next_page_token", None)
+
+    return {"ok": True, "prefix": prefix, "count": len(items), "items": items, "next_page_token": next_token}
+
+
+# =========================
+# Download (Signed URL)
+# =========================
 @app.get("/download")
 def get_signed_download_url(
-    gcs_uri: Optional[str] = None,
-    object_name: Optional[str] = None,
-    expires_minutes: int = 15,
+    gcs_uri: Optional[str] = Query(default=None),
+    object_name: Optional[str] = Query(default=None),
+    expires_minutes: int = Query(default=15, ge=1, le=1440),
 ):
     if not gcs_uri and not object_name:
         raise HTTPException(status_code=400, detail="Provide gcs_uri or object_name")
+
     if gcs_uri:
         if not gcs_uri.startswith("gs://"):
             raise HTTPException(status_code=400, detail="gcs_uri must start with gs://")
@@ -115,10 +207,12 @@ def get_signed_download_url(
         bucket_name, obj = without.split("/", 1)
     else:
         bucket_name, obj = BUCKET, object_name
+
     bucket = storage_client.bucket(bucket_name)
     blob = bucket.blob(obj)
     if not blob.exists():
         raise HTTPException(status_code=404, detail="Object not found")
+
     url = blob.generate_signed_url(
         version="v4",
         expiration=timedelta(minutes=expires_minutes),
@@ -127,15 +221,19 @@ def get_signed_download_url(
     )
     return {"ok": True, "signed_url": url}
 
-# ===== Approve =====
+
+# =========================
+# Approve (pending -> approved)
+# =========================
 @app.post("/approve")
 def approve_file(
-    gcs_uri: Optional[str] = None,
-    object_name: Optional[str] = None,
-    approver: str = "admin"
+    gcs_uri: Optional[str] = Query(default=None),
+    object_name: Optional[str] = Query(default=None),
+    approver: str = Query(default="admin"),
 ):
     if not gcs_uri and not object_name:
         raise HTTPException(status_code=400, detail="Provide gcs_uri or object_name")
+
     if gcs_uri:
         without = gcs_uri[5:]
         bucket_name, obj = without.split("/", 1)
@@ -147,7 +245,6 @@ def approve_file(
     if not blob.exists():
         raise HTTPException(status_code=404, detail="Object not found")
 
-    # Extract filename & proj_id
     parts = obj.split("/")
     if parts[0] != "pending":
         raise HTTPException(status_code=400, detail="Only pending files can be approved")
@@ -160,32 +257,42 @@ def approve_file(
 
     # Update metadata for new file
     new_blob = bucket.blob(new_path)
-    metadata = new_blob.metadata or {}
-    metadata.update({"status": "approved", "approver": approver, "approved_at": datetime.utcnow().isoformat()})
-    new_blob.metadata = metadata
+    md = new_blob.metadata or {}
+    md.update(
+        {
+            "status": "approved",
+            "approver": approver,
+            "approved_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    new_blob.metadata = md
     new_blob.patch()
 
     return {"ok": True, "from": obj, "to": new_path, "status": "approved"}
 
 
-# ===== Reject =====
+# =========================
+# Reject (pending -> rejected) + feedback
+# =========================
 @app.post("/reject")
 def reject_object(
-    object_name: str,           # ví dụ: pending/2025/08/solana/xxx.csv
-    rejector: str = "",         # người reject
-    feedback: str = "",         # feedback chi tiết
+    object_name: str = Query(..., description="e.g. pending/2025/08/solana/xxx.csv"),
+    rejector: str = Query(default=""),
+    feedback: str = Query(default=""),
 ):
     try:
         if not object_name.startswith("pending/"):
             raise HTTPException(status_code=400, detail="Only pending/* can be rejected")
 
-        bucket = storage_client.bucket(BUCKET)
+        bucket = require_bucket()
         src = bucket.blob(object_name)
         if not src.exists():
             raise HTTPException(status_code=404, detail="Source object not found")
 
-        # pending/YYYY/MM/proj/file.csv -> rejected/YYYY/MM/proj/file.csv
+        # pending/YYYY/MM/proj/file.ext -> rejected/YYYY/MM/proj/file.ext
         parts = object_name.split("/", 4)
+        if len(parts) < 5:
+            raise HTTPException(status_code=400, detail="Invalid object path format")
         dst_name = f"rejected/{parts[1]}/{parts[2]}/{parts[3]}/{parts[4]}"
 
         # copy sang rejected/...
@@ -195,12 +302,14 @@ def reject_object(
         dst = bucket.blob(dst_name)
         dst.reload()
         md = dst.metadata or {}
-        md.update({
-            "status": "rejected",
-            "rejected_by": rejector or "",
-            "rejected_at": datetime.now(timezone.utc).isoformat(),
-            "feedback": feedback or "",            # << lưu feedback
-        })
+        md.update(
+            {
+                "status": "rejected",
+                "rejected_by": rejector or "",
+                "rejected_at": datetime.now(timezone.utc).isoformat(),
+                "feedback": feedback or "",
+            }
+        )
         dst.metadata = md
         dst.patch()
 
@@ -212,7 +321,7 @@ def reject_object(
             "ok": True,
             "from": f"gs://{BUCKET}/{object_name}",
             "to": f"gs://{BUCKET}/{dst_name}",
-            "status": "rejected"
+            "status": "rejected",
         }
 
     except gexc.Forbidden as e:
